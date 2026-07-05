@@ -314,6 +314,82 @@ EOF
   fi
 }
 
+create_local_venv() {
+  if ! python3 -m venv .venv >/dev/null 2>&1; then
+    cat >&2 <<'EOF'
+error: failed to create the local Python virtualenv
+
+install the host package that provides python3-venv, and if your distro splits
+pip support separately, install python3-pip as well, then rerun the script.
+EOF
+    exit 1
+  fi
+}
+
+upgrade_local_venv_pip() {
+  if ! .venv/bin/python -m pip install --upgrade pip >/dev/null 2>&1; then
+    cat >&2 <<'EOF'
+error: pip is unavailable inside the local virtualenv
+
+install the host package that provides python3-venv, and if your distro splits
+pip support separately, install python3-pip as well, then rerun the script.
+EOF
+    exit 1
+  fi
+}
+
+local_vmlinux_to_elf_via_python_works() {
+  [[ -x .venv/bin/python ]] || return 1
+  [[ -f .venv/bin/vmlinux-to-elf ]] || return 1
+  .venv/bin/python .venv/bin/vmlinux-to-elf --help >/dev/null 2>&1
+}
+
+local_vmlinux_to_elf_wrapper_works() {
+  [[ -x .venv/bin/vmlinux-to-elf ]] || return 1
+  .venv/bin/vmlinux-to-elf --help >/dev/null 2>&1
+}
+
+ensure_local_vmlinux_to_elf() {
+  need_python_venv
+
+  if [[ ! -x .venv/bin/python ]]; then
+    create_local_venv
+  fi
+
+  if ! .venv/bin/python -c 'import sys; sys.exit(0)' >/dev/null 2>&1; then
+    echo "info: rebuilding repo-local .venv because the current Python interpreter is unusable" >&2
+    rm -rf .venv
+    create_local_venv
+  fi
+
+  if ! .venv/bin/python -m pip --version >/dev/null 2>&1; then
+    echo "info: rebuilding repo-local .venv because pip is unavailable" >&2
+    rm -rf .venv
+    create_local_venv
+  fi
+
+  upgrade_local_venv_pip
+
+  if [[ -f .venv/bin/vmlinux-to-elf ]] && ! local_vmlinux_to_elf_wrapper_works; then
+    echo "info: repairing repo-local vmlinux-to-elf because the existing wrapper is stale or unusable" >&2
+  fi
+
+  if ! .venv/bin/python -m pip install --upgrade --force-reinstall vmlinux-to-elf >/dev/null 2>&1; then
+    echo "error: failed to install vmlinux-to-elf into the local virtualenv" >&2
+    exit 1
+  fi
+
+  if ! local_vmlinux_to_elf_via_python_works; then
+    echo "error: local vmlinux-to-elf install completed, but the package is still unusable" >&2
+    exit 1
+  fi
+
+  if ! local_vmlinux_to_elf_wrapper_works; then
+    echo "error: local vmlinux-to-elf install completed, but the wrapper is still unusable" >&2
+    exit 1
+  fi
+}
+
 workspace_root="$(pwd)"
 input_base="$(basename "$kernel_input")"
 input_prefix="$input_base"
@@ -375,32 +451,12 @@ find_vmlinux_to_elf() {
     return
   fi
 
-  if [[ -x .venv/bin/vmlinux-to-elf ]]; then
+  if local_vmlinux_to_elf_wrapper_works; then
     echo ".venv/bin/vmlinux-to-elf"
     return
   fi
 
-  need_python_venv
-  if ! python3 -m venv .venv >/dev/null 2>&1; then
-    cat >&2 <<'EOF'
-error: failed to create the local Python virtualenv
-
-install the host package that provides python3-venv, and if your distro splits
-pip support separately, install python3-pip as well, then rerun the script.
-EOF
-    exit 1
-  fi
-  . .venv/bin/activate
-  if ! python -m pip install --upgrade pip >/dev/null 2>&1; then
-    cat >&2 <<'EOF'
-error: pip is unavailable inside the local virtualenv
-
-install the host package that provides python3-venv, and if your distro splits
-pip support separately, install python3-pip as well, then rerun the script.
-EOF
-    exit 1
-  fi
-  python -m pip install vmlinux-to-elf >/dev/null 2>&1
+  ensure_local_vmlinux_to_elf
   echo ".venv/bin/vmlinux-to-elf"
 }
 
