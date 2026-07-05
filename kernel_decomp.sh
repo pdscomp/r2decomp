@@ -233,6 +233,33 @@ EOF
   }
 }
 
+r2_pdg_install_tools=(
+  git
+  make
+  gcc
+  g++
+  pkg-config
+  patch
+  unzip
+  wget
+)
+
+r2pm_pdg_prereqs() {
+  local missing=()
+  local tool
+  for tool in "${r2_pdg_install_tools[@]}"; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+      missing+=("$tool")
+    fi
+  done
+
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    echo "error: pdg needs build tools for the r2ghidra install path: ${missing[*]}" >&2
+    echo "install them first, then rerun with pdg or use --decompiler pdc" >&2
+    exit 1
+  fi
+}
+
 r2_has_pdg() {
   local target="$1"
   local probe=""
@@ -248,6 +275,7 @@ ensure_r2_decompiler() {
   fi
 
   need_r2pm
+  r2pm_pdg_prereqs
   if r2_has_pdg "$target"; then
     return
   fi
@@ -274,6 +302,17 @@ need python3
 need gzip
 need arm-none-eabi-readelf
 need_r2
+
+need_python_venv() {
+  if ! python3 -c 'import venv' >/dev/null 2>&1; then
+    cat >&2 <<'EOF'
+error: python3 venv support is missing
+
+install the host package that provides python3-venv, then rerun the script.
+EOF
+    exit 1
+  fi
+}
 
 workspace_root="$(pwd)"
 input_base="$(basename "$kernel_input")"
@@ -341,10 +380,27 @@ find_vmlinux_to_elf() {
     return
   fi
 
-  python3 -m venv .venv
+  need_python_venv
+  if ! python3 -m venv .venv >/dev/null 2>&1; then
+    cat >&2 <<'EOF'
+error: failed to create the local Python virtualenv
+
+install the host package that provides python3-venv, and if your distro splits
+pip support separately, install python3-pip as well, then rerun the script.
+EOF
+    exit 1
+  fi
   . .venv/bin/activate
-  python -m pip install --upgrade pip >/dev/null
-  python -m pip install vmlinux-to-elf >/dev/null
+  if ! python -m pip install --upgrade pip >/dev/null 2>&1; then
+    cat >&2 <<'EOF'
+error: pip is unavailable inside the local virtualenv
+
+install the host package that provides python3-venv, and if your distro splits
+pip support separately, install python3-pip as well, then rerun the script.
+EOF
+    exit 1
+  fi
+  python -m pip install vmlinux-to-elf >/dev/null 2>&1
   echo ".venv/bin/vmlinux-to-elf"
 }
 

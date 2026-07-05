@@ -7,6 +7,41 @@ Command-line pseudo-C decompilation for:
 
 The scripts use `radare2` for analysis, `r2ghidra` for higher-quality `pdg` pseudo-C by default, and `vmlinux-to-elf` to rebuild a usable kernel ELF when the input is not already ELF.
 
+## Install
+
+The scripts expect a few host tools to be present:
+
+- `radare2` and `r2pm`
+- `binwalk`
+- `python3`
+- `python3-venv` and `python3-pip` for the kernel script's local virtualenv bootstrap
+- `file`, `od`, `dd`, `cp`, `gzip`
+- `arm-none-eabi-readelf`
+
+For the default `pdg` backend, `r2ghidra` is installed automatically through `r2pm`, but that path needs build tools available on the host:
+
+- `git`
+- `make`
+- `gcc`
+- `g++`
+- `pkg-config`
+- `patch`
+- `unzip`
+- `wget`
+
+On Debian/Ubuntu-style systems, a practical baseline is:
+
+```bash
+sudo apt install radare2 binwalk python3 python3-venv python3-pip file coreutils gzip binutils gcc g++ make pkg-config patch unzip wget
+```
+
+If `r2` is missing, the scripts print:
+
+```bash
+git clone https://github.com/radareorg/radare2
+cd radare2 ; sys/install.sh
+```
+
 ## Scripts
 
 - `kernel_decomp.sh`: extract or normalize a kernel image, rebuild `vmlinux.elf`, prepare symbols, and export pseudo-C
@@ -25,13 +60,6 @@ The scripts use `radare2` for analysis, `r2ghidra` for higher-quality `pdg` pseu
 - `cp`
 - `gzip`
 - `arm-none-eabi-readelf`
-
-If `r2` is missing, the scripts print:
-
-```bash
-git clone https://github.com/radareorg/radare2
-cd radare2 ; sys/install.sh
-```
 
 If `pdg` is selected and `r2ghidra` is missing, the scripts install it automatically with `r2pm`. They try `r2pm -ci r2ghidra` first, and if the local `r2pm` database is not initialized yet they retry after `r2pm -U`.
 

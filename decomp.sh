@@ -140,6 +140,22 @@ EOF
   }
 }
 
+r2pm_pdg_prereqs() {
+  local missing=()
+  local tool
+  for tool in git make gcc g++ pkg-config patch unzip wget; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+      missing+=("$tool")
+    fi
+  done
+
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    echo "error: pdg needs build tools for the r2ghidra install path: ${missing[*]}" >&2
+    echo "install them first, then rerun with pdg or use --decompiler pdc" >&2
+    exit 1
+  fi
+}
+
 r2_has_pdg() {
   local target="$1"
   local probe=""
@@ -155,6 +171,7 @@ ensure_r2_decompiler() {
   fi
 
   need_r2pm
+  r2pm_pdg_prereqs
   if r2_has_pdg "$target"; then
     return
   fi
@@ -175,6 +192,7 @@ ensure_r2_decompiler() {
 need file
 need python3
 need_r2
+ensure_r2_decompiler "$elf_input"
 
 file_desc="$(file -b "$elf_input")"
 if [[ "$file_desc" != ELF* ]]; then
@@ -201,8 +219,6 @@ else
   r2_batch="${output_dir}/${elf_base}.decompile-all-pdc.r2"
   pseudo_c_output="${output_dir}/${elf_base}.pdc.c"
 fi
-ensure_r2_decompiler "$elf_input"
-
 r2 -q -e bin.cache=true -c "${analysis_mode}; aflj; q" "$elf_input" > "$funcs_json"
 
 python3 - "$funcs_json" "$r2_batch" "$decompiler" "$analysis_mode" <<'PY'
