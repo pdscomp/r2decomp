@@ -89,6 +89,8 @@ If you want deeper analysis before decompilation, you can opt into `aaa`:
 
 `aaa` can improve some pseudocode, but it is materially slower on large kernel ELFs.
 
+On the sample kernel in this repo, `aa` took about `35s` median and `aaa` took about `97s` median, so `aaa` was roughly `2.8x` slower. For `sym.sitronix_ts_probe`, the visible `pdg` improvement from `aaa` was mostly better type and temporary inference, not a major control-flow rewrite. See [BENCHMARK.md](/home/paul/carbon/auto-decomp-radare2/BENCHMARK.md:1).
+
 ### External `kallsyms`
 
 If you have runtime symbols from the live device, pass them explicitly:
@@ -185,7 +187,7 @@ This script:
 3. Enumerates discovered functions.
 4. Writes a single combined pseudo-C file under the current working directory by default.
 
-The default backend is `pdg`. Use `--decompiler pdc` if you want the classic radare2 output instead. The default analysis mode is `aa`; use `--analysis-mode aaa` if you want deeper but slower radare2 analysis first.
+The default backend is `pdg`. Use `--decompiler pdc` if you want the classic radare2 output instead. The default analysis mode is `aa`; use `--analysis-mode aaa` if you want deeper but slower radare2 analysis first. On the sample kernel here, `aaa` was about `2.8x` slower and mostly changed inferred types/temporaries rather than structure.
 
 Outputs:
 
