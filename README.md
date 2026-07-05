@@ -5,7 +5,7 @@ Command-line pseudo-C decompilation for:
 - Linux kernel images, including Android boot images, `zImage`, `vmlinuz`, raw kernel blobs, and `vmlinux` ELF files
 - Ordinary ELF binaries such as `.ko` modules
 
-The scripts use `radare2` for analysis and `vmlinux-to-elf` to rebuild a usable kernel ELF when the input is not already ELF.
+The scripts use `radare2` for analysis, `r2ghidra` for higher-quality `pdg` pseudo-C by default, and `vmlinux-to-elf` to rebuild a usable kernel ELF when the input is not already ELF.
 
 ## Scripts
 
@@ -33,12 +33,14 @@ git clone https://github.com/radareorg/radare2
 cd radare2 ; sys/install.sh
 ```
 
+If `pdg` is selected and `r2ghidra` is missing, the scripts install it automatically with `r2pm`. They try `r2pm -ci r2ghidra` first, and if the local `r2pm` database is not initialized yet they retry after `r2pm -U`.
+
 If `vmlinux-to-elf` is missing, `kernel_decomp.sh` creates a local `.venv/` and installs it automatically.
 
 ## Kernel Workflow
 
 ```bash
-./kernel_decomp.sh [--kallsyms-file FILE] [--subset-file FILE] [--output-dir DIR] [--kallsyms-remap auto|none|0xOFFSET] <kernel-input>
+./kernel_decomp.sh [--kallsyms-file FILE] [--subset-file FILE] [--output-dir DIR] [--kallsyms-remap auto|none|0xOFFSET] [--decompiler pdg|pdc] <kernel-input>
 ```
 
 Default behavior:
@@ -47,7 +49,7 @@ Default behavior:
 2. Extract or copy the kernel payload.
 3. Rebuild `vmlinux.elf`.
 4. If no external `kallsyms` file is provided, generate `*.embedded-kallsyms.txt` from the rebuilt ELF symbol table.
-5. Select code symbols, run `radare2`, and write a combined `*.pdc.c` output.
+5. Select code symbols, run `radare2`, and write a combined pseudo-C output.
 
 This means the simplest path is now:
 
@@ -56,6 +58,24 @@ This means the simplest path is now:
 ```
 
 That produces a reconstructed ELF plus an embedded-symbol pseudo-C export under `out/`.
+
+### Decompiler Backend
+
+The default backend is `pdg`, which comes from the `r2ghidra` plugin and usually produces much cleaner structured C than classic `pdc`.
+
+Use the default:
+
+```bash
+./kernel_decomp.sh --subset-file kallsyms-sitronix-20260704-092316.txt kernel-01.03.01.89
+```
+
+Force classic radare2 pseudo-C:
+
+```bash
+./kernel_decomp.sh --decompiler pdc --subset-file kallsyms-sitronix-20260704-092316.txt kernel-01.03.01.89
+```
+
+This is mainly useful for comparison, compatibility, or when you want the old `pdc` behavior.
 
 ### External `kallsyms`
 
@@ -129,7 +149,7 @@ Common outputs under `out/...`:
 - `*.report.txt`
 - `*.selected-symbols.txt`
 - `*.skipped-symbols.txt`
-- `*.pdc.c`
+- `*.pdg.c` or `*.pdc.c`
 - `*.open-r2.sh`
 
 `*.report.txt` is the main place to check symbol counts, remap details, and why symbols were skipped.
@@ -137,7 +157,7 @@ Common outputs under `out/...`:
 ## ELF Workflow
 
 ```bash
-./decomp.sh <elf-binary>
+./decomp.sh [--decompiler pdg|pdc] [--output-dir DIR] <elf-binary>
 ```
 
 Example:
@@ -151,15 +171,17 @@ This script:
 1. Verifies the input is ELF.
 2. Runs `radare2` analysis once.
 3. Enumerates discovered functions.
-4. Writes a single combined pseudo-C file next to the ELF.
+4. Writes a single combined pseudo-C file under the current working directory by default.
+
+The default backend is `pdg`. Use `--decompiler pdc` if you want the classic radare2 output instead.
 
 Outputs:
 
 - `*.functions.json`
-- `*.decompile-all.r2`
-- `*.pdc.c`
+- `*.decompile-all-pdg.r2` or `*.decompile-all-pdc.r2`
+- `*.pdg.c` or `*.pdc.c`
 
-`decomp.sh` does not need a Python virtualenv because it does not rebuild the binary; it only drives `radare2` against an existing ELF.
+`decomp.sh` does not need a Python virtualenv because it does not rebuild the binary; it only drives `radare2` against an existing ELF. By default it writes sidecar files into the directory where you run the command, and `--output-dir` lets you override that.
 
 ## Recommended Use
 

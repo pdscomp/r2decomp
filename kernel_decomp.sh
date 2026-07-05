@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-usage: ./kernel_decomp.sh [--kallsyms-file FILE] [--subset-file FILE] [--output-dir DIR] [--kallsyms-remap auto|none|0xOFFSET] <kernel-input>
+usage: ./kernel_decomp.sh [--kallsyms-file FILE] [--subset-file FILE] [--output-dir DIR] [--kallsyms-remap auto|none|0xOFFSET] [--decompiler pdg|pdc] <kernel-input>
 
 supported kernel-input types:
   - Android boot images
@@ -29,6 +29,9 @@ options:
                   keep default behavior with 'none', infer a single additive
                   remap with 'auto', or provide an explicit hex offset to
                   subtract from non-module kallsyms addresses
+  --decompiler MODE
+                  choose pseudo-C backend: 'pdg' (default, via r2ghidra) or
+                  'pdc' (classic radare2 pseudo-C)
 
 subset-file format:
   - one symbol name per line, or
@@ -43,6 +46,7 @@ if [[ ${1:-} == "-h" || ${1:-} == "--help" ]]; then
 fi
 
 remap_mode="auto"
+decompiler="pdg"
 kallsyms_input=""
 subset_file=""
 output_dir=""
@@ -97,6 +101,18 @@ while [[ $# -gt 0 ]]; do
       remap_mode="${1#*=}"
       shift
       ;;
+    --decompiler)
+      if [[ $# -lt 2 ]]; then
+        echo "error: --decompiler requires a value" >&2
+        exit 1
+      fi
+      decompiler="$2"
+      shift 2
+      ;;
+    --decompiler=*)
+      decompiler="${1#*=}"
+      shift
+      ;;
     --)
       shift
       while [[ $# -gt 0 ]]; do
@@ -149,6 +165,15 @@ case "$remap_mode" in
     ;;
 esac
 
+case "$decompiler" in
+  pdg|pdc)
+    ;;
+  *)
+    echo "error: unsupported --decompiler mode: $decompiler" >&2
+    exit 1
+    ;;
+esac
+
 need() {
   command -v "$1" >/dev/null 2>&1 || {
     echo "error: missing required tool: $1" >&2
@@ -169,6 +194,51 @@ install it with:
   cd radare2 ; sys/install.sh
 EOF
   exit 1
+}
+
+need_r2pm() {
+  command -v r2pm >/dev/null 2>&1 || {
+    cat >&2 <<'EOF'
+error: r2pm is required to install the r2ghidra plugin for pdg output
+
+install radare2 with:
+  git clone https://github.com/radareorg/radare2
+  cd radare2 ; sys/install.sh
+EOF
+    exit 1
+  }
+}
+
+r2_has_pdg() {
+  local target="$1"
+  local probe=""
+  probe="$(r2 -q -e scr.color=0 -e scr.interactive=false -c 'pdg?; q' "$target" 2>&1 || true)"
+  [[ "$probe" == *"Native Ghidra decompiler plugin"* ]] && [[ "$probe" != *"install the plugin"* ]]
+}
+
+ensure_r2_decompiler() {
+  local target="$1"
+
+  if [[ "$decompiler" == "pdc" ]]; then
+    return
+  fi
+
+  need_r2pm
+  if r2_has_pdg "$target"; then
+    return
+  fi
+
+  echo "info: installing r2ghidra with r2pm -ci r2ghidra" >&2
+  if ! r2pm -ci r2ghidra; then
+    echo "info: initializing r2pm package database and retrying r2ghidra install" >&2
+    r2pm -U
+    r2pm -ci r2ghidra
+  fi
+
+  if ! r2_has_pdg "$target"; then
+    echo "error: requested pdg output, but r2ghidra is still unavailable after installation" >&2
+    exit 1
+  fi
 }
 
 need file
@@ -227,13 +297,13 @@ kallsyms_overlay="${output_dir}/${kallsyms_stem}.extra-core.r2"
 kallsyms_modules="${output_dir}/${kallsyms_stem}.modules.txt"
 selected_symbols="${output_dir}/${kallsyms_stem}.selected-symbols.txt"
 selected_skipped="${output_dir}/${kallsyms_stem}.skipped-symbols.txt"
-r2_batch="${output_dir}/${kallsyms_stem}.decompile.r2"
+r2_batch="${output_dir}/${kallsyms_stem}.decompile-${decompiler}.r2"
 r2_helper="${output_dir}/${input_prefix}.open-r2.sh"
 
 if [[ -n "$subset_stem" ]]; then
-  pseudo_c_output="${output_dir}/${kallsyms_stem}__${subset_stem}.pdc.c"
+  pseudo_c_output="${output_dir}/${kallsyms_stem}__${subset_stem}.${decompiler}.c"
 else
-  pseudo_c_output="${output_dir}/${kallsyms_stem}.pdc.c"
+  pseudo_c_output="${output_dir}/${kallsyms_stem}.${decompiler}.c"
 fi
 
 find_vmlinux_to_elf() {
@@ -309,6 +379,7 @@ if [[ "$source_desc" == Android\ bootimg* ]]; then
     echo "input_kind: $payload_kind"
     echo "kallsyms: ${kallsyms_input:-<embedded-from-elf>}"
     echo "kallsyms_remap: $remap_mode"
+    echo "decompiler: $decompiler"
     if [[ -n "$subset_file" ]]; then
       echo "subset_file: $subset_file"
     fi
@@ -343,6 +414,7 @@ else
     echo "input_kind: $payload_kind"
     echo "kallsyms: ${kallsyms_input:-<embedded-from-elf>}"
     echo "kallsyms_remap: $remap_mode"
+    echo "decompiler: $decompiler"
     if [[ -n "$subset_file" ]]; then
       echo "subset_file: $subset_file"
     fi
@@ -381,11 +453,11 @@ if [[ -z "$kallsyms_input" ]]; then
   kallsyms_modules="${output_dir}/${kallsyms_stem}.modules.txt"
   selected_symbols="${output_dir}/${kallsyms_stem}.selected-symbols.txt"
   selected_skipped="${output_dir}/${kallsyms_stem}.skipped-symbols.txt"
-  r2_batch="${output_dir}/${kallsyms_stem}.decompile.r2"
+  r2_batch="${output_dir}/${kallsyms_stem}.decompile-${decompiler}.r2"
   if [[ -n "$subset_stem" ]]; then
-    pseudo_c_output="${output_dir}/${kallsyms_stem}__${subset_stem}.pdc.c"
+    pseudo_c_output="${output_dir}/${kallsyms_stem}__${subset_stem}.${decompiler}.c"
   else
-    pseudo_c_output="${output_dir}/${kallsyms_stem}.pdc.c"
+    pseudo_c_output="${output_dir}/${kallsyms_stem}.${decompiler}.c"
   fi
   kallsyms_source_mode="embedded"
   effective_remap_mode="none"
@@ -443,7 +515,9 @@ out_path.write_text("\n".join(lines) + ("\n" if lines else ""))
 PY
 fi
 
-python3 - "$vmlinux_elf" "$kallsyms_input" "$subset_file" "$kallsyms_report" "$kallsyms_normalized" "$kallsyms_overlay" "$kallsyms_modules" "$selected_symbols" "$selected_skipped" "$effective_remap_mode" "$kallsyms_source_mode" <<'PY'
+ensure_r2_decompiler "$vmlinux_elf"
+
+python3 - "$vmlinux_elf" "$kallsyms_input" "$subset_file" "$kallsyms_report" "$kallsyms_normalized" "$kallsyms_overlay" "$kallsyms_modules" "$selected_symbols" "$selected_skipped" "$effective_remap_mode" "$kallsyms_source_mode" "$decompiler" <<'PY'
 import re
 import subprocess
 import sys
@@ -461,6 +535,7 @@ selected_path = Path(sys.argv[8])
 skipped_path = Path(sys.argv[9])
 remap_mode = sys.argv[10]
 kallsyms_source_mode = sys.argv[11]
+decompiler = sys.argv[12]
 
 sym_re = re.compile(r'^\s*\d+:\s+([0-9a-fA-F]+)\s+\d+\s+\S+\s+\S+\s+\S+\s+\S+\s+(.+)$')
 section_re = re.compile(
@@ -670,6 +745,7 @@ with report_path.open("w") as fh:
     fh.write(f"input kallsyms: {kallsyms_path.name}\n")
     fh.write(f"kallsyms source mode: {kallsyms_source_mode}\n")
     fh.write(f"kernel ELF: {elf_path.name}\n")
+    fh.write(f"decompiler: {decompiler}\n")
     fh.write(f"kallsyms remap mode: {remap_mode}\n")
     fh.write(f"kallsyms remap method: {remap_method}\n")
     fh.write(f"kallsyms remap offset: 0x{remap_offset:x}\n")
@@ -741,6 +817,7 @@ fi
   echo "e bin.cache=true"
   echo "aa"
   echo "?e // pseudo-c export driven by ${kallsyms_base}"
+  echo "?e // decompiler: ${decompiler}"
   echo "?e // kallsyms remap mode: ${effective_remap_mode}"
   echo "?e // kallsyms source mode: ${kallsyms_source_mode}"
   if [[ -n "$subset_file" ]]; then
@@ -752,7 +829,7 @@ fi
     echo "?e // ----- BEGIN ${name} (${sym_type}) [${section}] file=${addr} runtime=${orig_addr} -----"
     echo "s ${addr}"
     echo "af"
-    echo "pdc"
+    echo "${decompiler}"
     echo "?e // ----- END ${name} -----"
   done < "$selected_symbols"
   echo "q"
