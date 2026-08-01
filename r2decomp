@@ -456,6 +456,86 @@ elif [[ -n "$r2_asm_arch" ]]; then
 fi
 r2 "${final_r2_opts[@]}" -i "$r2_batch" "$elf_input" > "$pseudo_c_output"
 
+# Inline string literals: r2ghidra only renders strings whose references its
+# own analysis resolved. Interleaved movw/movt pairs and table-driven string
+# loads slip through and print as raw hex. Post-pass: replace any whole-token
+# hex constant that matches a known string's address with the quoted string.
+python3 - "$elf_input" "$pseudo_c_output" <<'PY'
+import json
+import re
+import subprocess
+import sys
+
+binary, c_path = sys.argv[1], sys.argv[2]
+
+try:
+    out = subprocess.run(
+        ["r2", "-q", "-c", "izj", binary],
+        capture_output=True, text=True, timeout=300,
+    )
+    strings = json.loads(out.stdout or "[]")
+except Exception as exc:
+    print(f"note: string inlining skipped ({exc})", file=sys.stderr)
+    sys.exit(0)
+
+str_map = {}
+with open(binary, "rb") as fh:
+    blob = fh.read()
+for s in strings:
+    va, paddr, size = s.get("vaddr"), s.get("paddr"), s.get("size")
+    if not va or paddr is None or not size:
+        continue
+    raw = blob[paddr:paddr + size]
+    # Rebuild the true bytes from the binary itself, then emit a correct C
+    # literal. Skip anything that is not clean printable ASCII + \n \t \r.
+    chars = []
+    ok = True
+    for b in raw:
+        if b == 0:
+            break
+        if b in (10, 9, 13):
+            chars.append({10: "\\n", 9: "\\t", 13: "\\r"}[b])
+        elif b in (34, 92):  # '"' and '\'
+            chars.append("\\" + chr(b))
+        elif 32 <= b < 127:
+            chars.append(chr(b))
+        else:
+            ok = False
+            break
+    val = "".join(chars)
+    if ok and len(val) >= 4:
+        str_map[va] = val
+if not str_map:
+    sys.exit(0)
+
+def c_quote(s):
+    # s is already C-escaped by construction above
+    return '"' + s + '"'
+
+token = re.compile(r"(?<![\w.])0x[0-9a-fA-F]+\b")
+
+def repl(m):
+    val = str_map.get(int(m.group(0), 16))
+    return c_quote(val) if val is not None else m.group(0)
+
+with open(c_path) as fh:
+    text = fh.read()
+
+lines = []
+n_sub = 0
+for line in text.splitlines(keepends=True):
+    if line.lstrip().startswith("//"):
+        lines.append(line)
+        continue
+    new, k = token.subn(repl, line)
+    n_sub += k
+    lines.append(new)
+
+with open(c_path, "w") as fh:
+    fh.writelines(lines)
+print(f"note: inlined {n_sub} string literal(s) into {c_path}", file=sys.stderr)
+PY
+
 echo "wrote:"
 echo "  input: $input_kind (arch=${r2_asm_arch:-auto}, bits=${r2_asm_bits:-auto}${r2_base:+, base=$r2_base})"
 echo "  $funcs_json"
