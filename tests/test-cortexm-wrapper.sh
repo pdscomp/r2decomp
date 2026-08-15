@@ -32,6 +32,8 @@ def payload(base):
     blob[0x64:0x68] = b"\x70\x47\x00\xbf"
     blob[0x68:0x6c] = b"\x00\xbf\x00\xbf"  # vector into known function
     blob[0x6c:0x70] = b"\x70\x47\x00\xbf"
+    blob[0x70:0x74] = b"\x70\x47\x00\xbf"  # lower shared entry
+    blob[0x80:0x84] = b"\xf6\xe7\x00\xbf"  # higher function branches to 0x70
     # This aligned Thumb pointer is beyond the 256-entry vector scan, so its
     # target is deliberately generic/unnamed.
     struct.pack_into("<I", blob, 0x400, base + 0x65)
@@ -48,9 +50,11 @@ Path(sys.argv[4]).write_bytes(
 Path(sys.argv[5]).write_bytes(wrapped_header + payload(0x08000000))
 PY
 
-"$repo/r2decomp" --decompiler pdc --analysis-mode aa \
+"$repo/r2decomp" --decompiler pdc --analysis-mode aaa \
   --function known_fallthrough@0x0800C060 \
   --function known_after_vector@0134266988 \
+  --function lower_shared@0x0800C070 \
+  --function higher_shared@0x0800C080 \
   --output-dir "$tmp/wrapped-out" "$tmp/wrapped.bin" >/dev/null
 
 python3 - "$tmp/wrapped-out/wrapped.bin.functions.json" <<'PY'
@@ -68,6 +72,8 @@ expected = {
     "known_fallthrough": 0x0800C060,
     "IRQ1_Handler": 0x0800C068,
     "known_after_vector": 0x0800C06C,
+    "lower_shared": 0x0800C070,
+    "higher_shared": 0x0800C080,
 }
 for name, address in expected.items():
     assert by_name[name] == address, (name, by_name)

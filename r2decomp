@@ -496,7 +496,130 @@ done
 analysis_commands+="; aflj; q"
 r2 "${analysis_r2_opts[@]}" -c "$analysis_commands" "$elf_input" > "$funcs_json"
 
-python3 - "$funcs_json" "$r2_batch" "$decompiler" "$analysis_mode" "$r2_asm_arch" "$r2_asm_bits" "$r2_base" "${known_functions[@]}" <<'PY'
+raw_repair_r2=""
+if [[ -n "$raw_seed_r2" && "${#known_functions[@]}" -gt 0 ]]; then
+  raw_repair_r2="${output_dir}/${elf_base}.raw-repair.r2"
+  python3 - "$funcs_json" "$raw_repair_r2" "${known_functions[@]}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+functions_path, script_path, *known_functions = sys.argv[1:]
+functions = json.loads(Path(functions_path).read_text() or "[]")
+known = {}
+for spec in known_functions:
+    name, address = spec.rsplit("@", 1)
+    known[int(address, 16 if address.lower().startswith("0x") else 10)] = name
+
+exact = {fn.get("addr", fn.get("offset")) for fn in functions}
+missing = set(known) - exact
+if not missing:
+    Path(script_path).write_text("")
+    sys.exit(0)
+victims = set()
+for fn in functions:
+    address = fn.get("addr", fn.get("offset"))
+    if address is None:
+        continue
+    start = fn.get("minaddr", address)
+    end = fn.get("maxaddr", address + fn.get("size", 0))
+    if any(address != target and start <= target < end for target in missing):
+        victims.add(address)
+
+with Path(script_path).open("w") as fh:
+    for address in sorted(victims):
+        fh.write(f"af- 0x{address:x}\n")
+    # Authoritative user-supplied entries must exist before recreating callers
+    # whose non-linear basic-block ranges previously swallowed them.
+    for address in sorted(missing, reverse=True):
+        fh.write(f"af @ 0x{address:x}\n")
+    for address in sorted(victims, reverse=True):
+        fh.write(f"af @ 0x{address:x}\n")
+    for address, name in sorted(known.items()):
+        fh.write(f"afn {name} 0x{address:x}\n")
+PY
+
+  if [[ -s "$raw_repair_r2" ]]; then
+    repaired_analysis_commands="$analysis_mode"
+    while IFS= read -r command; do
+      repaired_analysis_commands+="; $command"
+    done < "$raw_repair_r2"
+    repaired_analysis_commands+="; aflj; q"
+    r2 "${analysis_r2_opts[@]}" -c "$repaired_analysis_commands" "$elf_input" > "$funcs_json"
+
+    trimmed="$(python3 - "$funcs_json" "$raw_repair_r2" "${known_functions[@]}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+functions_path, script_path, *known_functions = sys.argv[1:]
+functions = json.loads(Path(functions_path).read_text() or "[]")
+known = {}
+for spec in known_functions:
+    name, address = spec.rsplit("@", 1)
+    known[int(address, 16 if address.lower().startswith("0x") else 10)] = name
+exact = {fn.get("addr", fn.get("offset")) for fn in functions}
+missing = sorted(set(known) - exact)
+
+commands = []
+for target in missing:
+    owners = []
+    for fn in functions:
+        address = fn.get("addr", fn.get("offset"))
+        if address is None or address >= target:
+            continue
+        start = fn.get("minaddr", address)
+        end = fn.get("maxaddr", address + fn.get("size", 0))
+        if start <= target < end:
+            owners.append(address)
+    if owners:
+        owner = max(owners)
+        commands.extend((
+            f"af- 0x{owner:x}",
+            f"af+ 0x{owner:x}",
+            f"afb+ 0x{owner:x} 0x{owner:x} 0x{target - owner:x}",
+        ))
+    commands.extend((f"af @ 0x{target:x}", f"afn {known[target]} 0x{target:x}"))
+
+if commands:
+    with Path(script_path).open("a") as fh:
+        fh.write("\n".join(commands) + "\n")
+print(int(bool(commands)))
+PY
+)"
+    if [[ "$trimmed" -eq 1 ]]; then
+      repaired_analysis_commands="$analysis_mode"
+      while IFS= read -r command; do
+        repaired_analysis_commands+="; $command"
+      done < "$raw_repair_r2"
+      repaired_analysis_commands+="; aflj; q"
+      r2 "${analysis_r2_opts[@]}" -c "$repaired_analysis_commands" "$elf_input" > "$funcs_json"
+    fi
+
+    python3 - "$funcs_json" "${known_functions[@]}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+functions_path, *known_functions = sys.argv[1:]
+functions = json.loads(Path(functions_path).read_text() or "[]")
+actual = {
+    (fn.get("addr", fn.get("offset")), fn.get("name"))
+    for fn in functions
+}
+missing = []
+for spec in known_functions:
+    name, address = spec.rsplit("@", 1)
+    address = int(address, 16 if address.lower().startswith("0x") else 10)
+    if (address, name) not in actual:
+        missing.append(spec)
+if missing:
+    raise SystemExit("error: unable to preserve raw function boundary: " + ", ".join(missing))
+PY
+  fi
+fi
+
+python3 - "$funcs_json" "$r2_batch" "$decompiler" "$analysis_mode" "$r2_asm_arch" "$r2_asm_bits" "$r2_base" "$raw_repair_r2" "${known_functions[@]}" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -506,7 +629,8 @@ batch_path = Path(sys.argv[2])
 asm_arch = sys.argv[5]
 asm_bits = sys.argv[6]
 base = sys.argv[7]
-known_functions = sys.argv[8:]
+repair_path = sys.argv[8]
+known_functions = sys.argv[9:]
 
 data = json.loads(funcs_path.read_text() or "[]")
 
@@ -519,6 +643,8 @@ with batch_path.open("w") as fh:
     if asm_bits:
         fh.write(f"e asm.bits={asm_bits}\n")
     fh.write(f"{sys.argv[4]}\n")
+    if repair_path and Path(repair_path).is_file():
+        fh.writelines(Path(repair_path).read_text().splitlines(keepends=True))
     for spec in known_functions:
         name, address = spec.rsplit("@", 1)
         fh.write(f"s {address}\n")

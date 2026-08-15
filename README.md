@@ -228,7 +228,8 @@ This script:
 3. For Cortex-M images, seeds the vector handlers and every aligned in-image
    Thumb function pointer before analysis. This recovers table-driven Klipper
    callbacks that `aa`/`aaa` cannot reach from the updater header or reset path.
-4. Runs `radare2` analysis once.
+4. Runs `radare2` analysis. If deep analysis absorbs a supplied entry point
+   into an overlapping function, it repairs that boundary before export.
 5. Optionally creates and names known functions supplied as repeatable
    `--function NAME@ADDRESS` arguments. This is useful for a small firmware
    blob where `aa` cannot discover every function without a slower `aaa`.
@@ -259,6 +260,7 @@ Outputs:
 
 - `*.functions.json`
 - `*.raw-seeds.r2` for raw Cortex-M inputs
+- `*.raw-repair.r2` when named raw functions are supplied (empty if no repair is needed)
 - `*.decompile-all-pdg.r2` or `*.decompile-all-pdc.r2`
 - `*.pdg.c` or `*.pdc.c`
 
