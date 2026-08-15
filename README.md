@@ -220,15 +220,20 @@ This script:
 1. Detects the architecture of ELF inputs automatically. ARM32/armv7l maps to
    radare2 ARM-32, and AArch64 maps to ARM-64.
 2. Detects a raw Cortex-M/Thumb image from a valid vector table at offset zero
-   or after the common 0x4000-byte updater header. It maps those images at
-   `0x08000000` and `0x08008000`, respectively. For any other raw image,
-   specify `--raw --arch --bits --base` explicitly.
-3. Runs `radare2` analysis once.
-4. Optionally creates and names known functions supplied as repeatable
+   or after the common 0x4000-byte updater header. It maps offset-zero images
+   at `0x08000000`. Wrapped images map the whole file at `0x08008000`, placing
+   the vector table and executable payload at `0x0800c000`; this preserves the
+   metadata-sector/application-sector layout. For any other raw image, specify
+   `--raw --arch --bits --base` explicitly.
+3. For Cortex-M images, seeds the vector handlers and every aligned in-image
+   Thumb function pointer before analysis. This recovers table-driven Klipper
+   callbacks that `aa`/`aaa` cannot reach from the updater header or reset path.
+4. Runs `radare2` analysis once.
+5. Optionally creates and names known functions supplied as repeatable
    `--function NAME@ADDRESS` arguments. This is useful for a small firmware
    blob where `aa` cannot discover every function without a slower `aaa`.
-5. Enumerates discovered functions.
-6. Writes a single combined pseudo-C file under the current working directory
+6. Enumerates discovered functions.
+7. Writes a single combined pseudo-C file under the current working directory
    by default.
 
 For example, this reproduces the focused HX711 firmware workflow without a
@@ -253,6 +258,7 @@ The default backend is `pdg`. Use `--decompiler pdc` if you want the classic rad
 Outputs:
 
 - `*.functions.json`
+- `*.raw-seeds.r2` for raw Cortex-M inputs
 - `*.decompile-all-pdg.r2` or `*.decompile-all-pdc.r2`
 - `*.pdg.c` or `*.pdc.c`
 

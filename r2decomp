@@ -299,6 +299,7 @@ fi
 r2_asm_arch=""
 r2_asm_bits=""
 r2_base=""
+vector_offset=""
 input_kind="ELF"
 
 normalize_arch() {
@@ -320,7 +321,6 @@ else
   input_kind="raw"
   # A Cortex-M vector begins with an SRAM stack pointer and an odd reset
   # handler. Updater images often prepend a 0x4000-byte metadata header.
-  vector_offset=""
   for candidate in 0 16384; do
     words="$(od -An -N8 -j "$candidate" -tu4 "$elf_input" 2>/dev/null || true)"
     read -r stack_pointer reset_handler <<<"$words"
@@ -375,6 +375,7 @@ if [[ ! -w "$output_dir" ]]; then
 fi
 
 funcs_json="${output_dir}/${elf_base}.functions.json"
+raw_seed_r2=""
 if [[ "$decompiler" == "pdg" ]]; then
   r2_batch="${output_dir}/${elf_base}.decompile-all-pdg.r2"
   pseudo_c_output="${output_dir}/${elf_base}.pdg.c"
@@ -382,12 +383,89 @@ else
   r2_batch="${output_dir}/${elf_base}.decompile-all-pdc.r2"
   pseudo_c_output="${output_dir}/${elf_base}.pdc.c"
 fi
+
+if [[ "$is_elf" -eq 0 && -n "$vector_offset" \
+   && "$r2_asm_arch" == "arm" && "$r2_asm_bits" == "16" ]]; then
+  raw_seed_r2="${output_dir}/${elf_base}.raw-seeds.r2"
+  python3 - "$elf_input" "$raw_seed_r2" "$vector_offset" "$r2_base" <<'PY'
+import collections
+import struct
+import sys
+from pathlib import Path
+
+binary, script, vector_offset, base = sys.argv[1:]
+blob = Path(binary).read_bytes()
+vector_offset = int(vector_offset, 0)
+base = int(base, 0)
+image_start = base + vector_offset
+image_end = base + len(blob)
+
+# Cortex-M callback tables store Thumb function pointers with bit zero set.
+# Seeding every aligned in-image pointer gives radare2 the roots it needs to
+# follow table-driven callbacks that aa/aaa cannot discover from entry0.
+targets = set()
+for offset in range(vector_offset, len(blob) - 3, 4):
+    value = struct.unpack_from("<I", blob, offset)[0]
+    target = value & ~1
+    if value & 1 and image_start <= target < image_end:
+        targets.add(target)
+
+core_names = {
+    1: "Reset_Handler",
+    2: "NMI_Handler",
+    3: "HardFault_Handler",
+    4: "MemManage_Handler",
+    5: "BusFault_Handler",
+    6: "UsageFault_Handler",
+    11: "SVCall_Handler",
+    12: "DebugMon_Handler",
+    14: "PendSV_Handler",
+    15: "SysTick_Handler",
+}
+vectors = []
+for index in range(1, min(256, (len(blob) - vector_offset) // 4)):
+    value = struct.unpack_from("<I", blob, vector_offset + index * 4)[0]
+    target = value & ~1
+    if value == 0:
+        continue
+    if not (value & 1 and image_start <= target < image_end):
+        if index >= 16:
+            break
+        continue
+    vectors.append((index, target))
+
+counts = collections.Counter(target for _, target in vectors)
+names = {}
+for index, target in vectors:
+    if counts[target] > 1:
+        names[target] = "Default_Handler"
+    elif index in core_names:
+        names[target] = core_names[index]
+    else:
+        names[target] = f"IRQ{index - 16}_Handler"
+
+with Path(script).open("w") as fh:
+    # Establish vector functions before generic analysis can create an
+    # overlapping function that hides a short reset/default handler.
+    for target in sorted(names):
+        fh.write(f"af @ 0x{target:x}\n")
+    for target, name in sorted(names.items()):
+        fh.write(f"afn {name} 0x{target:x}\n")
+    for target in sorted(targets - names.keys()):
+        fh.write(f"af @ 0x{target:x}\n")
+    fh.write("aac\n")
+PY
+fi
+
 analysis_r2_opts=(-q -e bin.cache=true)
 if [[ "$is_elf" -eq 0 ]]; then
   # Do not add -n here. Recent radare2 releases can crash when -n is combined
   # with a mapped raw ARM image; the normal raw loader is both sufficient and
   # the invocation used by the original Thumb analysis scripts.
   analysis_r2_opts+=(-a "$r2_asm_arch" -b "$r2_asm_bits" -m "$r2_base")
+  if [[ -n "$raw_seed_r2" ]]; then
+    analysis_r2_opts+=(-i "$raw_seed_r2")
+  fi
 elif [[ -n "$r2_asm_arch" ]]; then
   analysis_r2_opts+=(-e "asm.arch=${r2_asm_arch}" -e "asm.bits=${r2_asm_bits}")
 fi
@@ -451,6 +529,9 @@ PY
 final_r2_opts=(-q -e bin.cache=true -e scr.color=0)
 if [[ "$is_elf" -eq 0 ]]; then
   final_r2_opts+=(-a "$r2_asm_arch" -b "$r2_asm_bits" -m "$r2_base")
+  if [[ -n "$raw_seed_r2" ]]; then
+    final_r2_opts+=(-i "$raw_seed_r2")
+  fi
 elif [[ -n "$r2_asm_arch" ]]; then
   final_r2_opts+=(-e "asm.arch=${r2_asm_arch}" -e "asm.bits=${r2_asm_bits}")
 fi
@@ -460,17 +541,22 @@ r2 "${final_r2_opts[@]}" -i "$r2_batch" "$elf_input" > "$pseudo_c_output"
 # own analysis resolved. Interleaved movw/movt pairs and table-driven string
 # loads slip through and print as raw hex. Post-pass: replace any whole-token
 # hex constant that matches a known string's address with the quoted string.
-python3 - "$elf_input" "$pseudo_c_output" <<'PY'
+python3 - "$elf_input" "$pseudo_c_output" "$is_elf" "$r2_asm_arch" "$r2_asm_bits" "$r2_base" <<'PY'
 import json
 import re
 import subprocess
 import sys
 
 binary, c_path = sys.argv[1], sys.argv[2]
+is_elf, asm_arch, asm_bits, base = sys.argv[3:]
 
 try:
+    command = ["r2", "-q"]
+    if is_elf == "0":
+        command += ["-a", asm_arch, "-b", asm_bits, "-m", base]
+    command += ["-c", "izj" if is_elf == "1" else "izzj", binary]
     out = subprocess.run(
-        ["r2", "-q", "-c", "izj", binary],
+        command,
         capture_output=True, text=True, timeout=300,
     )
     strings = json.loads(out.stdout or "[]")
@@ -479,13 +565,17 @@ except Exception as exc:
     sys.exit(0)
 
 str_map = {}
+raw_base = int(base, 0) if is_elf == "0" else None
 with open(binary, "rb") as fh:
     blob = fh.read()
 for s in strings:
     va, paddr, size = s.get("vaddr"), s.get("paddr"), s.get("size")
-    if not va or paddr is None or not size:
+    if va is None or not size:
         continue
-    raw = blob[paddr:paddr + size]
+    file_offset = va - raw_base if raw_base is not None else paddr
+    if file_offset is None or file_offset < 0 or file_offset + size > len(blob):
+        continue
+    raw = blob[file_offset:file_offset + size]
     # Rebuild the true bytes from the binary itself, then emit a correct C
     # literal. Skip anything that is not clean printable ASCII + \n \t \r.
     chars = []
@@ -513,23 +603,25 @@ def c_quote(s):
     return '"' + s + '"'
 
 token = re.compile(r"(?<![\w.])0x[0-9a-fA-F]+\b")
+n_sub = 0
 
 def repl(m):
+    global n_sub
     val = str_map.get(int(m.group(0), 16))
-    return c_quote(val) if val is not None else m.group(0)
+    if val is None:
+        return m.group(0)
+    n_sub += 1
+    return c_quote(val)
 
 with open(c_path) as fh:
     text = fh.read()
 
 lines = []
-n_sub = 0
 for line in text.splitlines(keepends=True):
     if line.lstrip().startswith("//"):
         lines.append(line)
         continue
-    new, k = token.subn(repl, line)
-    n_sub += k
-    lines.append(new)
+    lines.append(token.sub(repl, line))
 
 with open(c_path, "w") as fh:
     fh.writelines(lines)
@@ -539,5 +631,8 @@ PY
 echo "wrote:"
 echo "  input: $input_kind (arch=${r2_asm_arch:-auto}, bits=${r2_asm_bits:-auto}${r2_base:+, base=$r2_base})"
 echo "  $funcs_json"
+if [[ -n "$raw_seed_r2" ]]; then
+  echo "  $raw_seed_r2"
+fi
 echo "  $r2_batch"
 echo "  $pseudo_c_output"
