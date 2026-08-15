@@ -321,13 +321,25 @@ else
   input_kind="raw"
   # A Cortex-M vector begins with an SRAM stack pointer and an odd reset
   # handler. Updater images often prepend a 0x4000-byte metadata header.
+  input_size="$(stat -c %s -- "$elf_input")"
   for candidate in 0 16384; do
+    if (( input_size - candidate < 64 )); then
+      continue
+    fi
+    if (( candidate == 16384 )); then
+      candidate_base=$((0x08008000))
+    else
+      candidate_base=$((0x08000000))
+    fi
+    image_start=$((candidate_base + candidate))
+    image_end=$((candidate_base + input_size))
     words="$(od -An -N8 -j "$candidate" -tu4 "$elf_input" 2>/dev/null || true)"
     read -r stack_pointer reset_handler <<<"$words"
+    reset_target=$((reset_handler & ~1))
     if [[ "$stack_pointer" =~ ^[0-9]+$ ]] && [[ "$reset_handler" =~ ^[0-9]+$ ]] \
        && (( (stack_pointer & 0xff000000) == 0x20000000 )) \
        && (( (reset_handler & 1) == 1 )) \
-       && (( (reset_handler & 0xff000000) == 0x08000000 )); then
+       && (( reset_target >= image_start && reset_target < image_end )); then
       vector_offset="$candidate"
       break
     fi
@@ -354,7 +366,11 @@ if [[ "$base" != auto ]]; then
     echo "error: --base must be a decimal or hexadecimal address: $base" >&2
     exit 1
   fi
-  r2_base="$base"
+  if [[ "$base" =~ ^0[xX] ]]; then
+    r2_base="$base"
+  else
+    r2_base="$(python3 -c 'import sys; print(int(sys.argv[1], 10))' "$base")"
+  fi
 fi
 
 if [[ "$is_elf" -eq 0 ]] && [[ -z "$r2_asm_arch" || -z "$r2_asm_bits" || -z "$r2_base" ]]; then
@@ -387,13 +403,13 @@ fi
 if [[ "$is_elf" -eq 0 && -n "$vector_offset" \
    && "$r2_asm_arch" == "arm" && "$r2_asm_bits" == "16" ]]; then
   raw_seed_r2="${output_dir}/${elf_base}.raw-seeds.r2"
-  python3 - "$elf_input" "$raw_seed_r2" "$vector_offset" "$r2_base" <<'PY'
+  python3 - "$elf_input" "$raw_seed_r2" "$vector_offset" "$r2_base" "${known_functions[@]}" <<'PY'
 import collections
 import struct
 import sys
 from pathlib import Path
 
-binary, script, vector_offset, base = sys.argv[1:]
+binary, script, vector_offset, base, *known_functions = sys.argv[1:]
 blob = Path(binary).read_bytes()
 vector_offset = int(vector_offset, 0)
 base = int(base, 0)
@@ -444,15 +460,17 @@ for index, target in vectors:
     else:
         names[target] = f"IRQ{index - 16}_Handler"
 
+for spec in known_functions:
+    name, address = spec.rsplit("@", 1)
+    names[int(address, 16 if address.lower().startswith("0x") else 10)] = name
+
 with Path(script).open("w") as fh:
-    # Establish vector functions before generic analysis can create an
-    # overlapping function that hides a short reset/default handler.
-    for target in sorted(names):
+    # Establish every entry point from high to low before generic analysis can
+    # create an overlapping function that hides a later callback.
+    for target in sorted(targets | names.keys(), reverse=True):
         fh.write(f"af @ 0x{target:x}\n")
     for target, name in sorted(names.items()):
         fh.write(f"afn {name} 0x{target:x}\n")
-    for target in sorted(targets - names.keys()):
-        fh.write(f"af @ 0x{target:x}\n")
     fh.write("aac\n")
 PY
 fi
@@ -541,22 +559,19 @@ r2 "${final_r2_opts[@]}" -i "$r2_batch" "$elf_input" > "$pseudo_c_output"
 # own analysis resolved. Interleaved movw/movt pairs and table-driven string
 # loads slip through and print as raw hex. Post-pass: replace any whole-token
 # hex constant that matches a known string's address with the quoted string.
-python3 - "$elf_input" "$pseudo_c_output" "$is_elf" "$r2_asm_arch" "$r2_asm_bits" "$r2_base" <<'PY'
+python3 - "$elf_input" "$pseudo_c_output" <<'PY'
 import json
 import re
 import subprocess
 import sys
 
 binary, c_path = sys.argv[1], sys.argv[2]
-is_elf, asm_arch, asm_bits, base = sys.argv[3:]
 
 try:
-    command = ["r2", "-q"]
-    if is_elf == "0":
-        command += ["-a", asm_arch, "-b", asm_bits, "-m", base]
-    command += ["-c", "izj" if is_elf == "1" else "izzj", binary]
+    # Keep raw binaries on section-string discovery. Whole-file `izzj` treats
+    # printable instruction bytes as strings and can rewrite branch targets.
     out = subprocess.run(
-        command,
+        ["r2", "-q", "-c", "izj", binary],
         capture_output=True, text=True, timeout=300,
     )
     strings = json.loads(out.stdout or "[]")
@@ -565,17 +580,15 @@ except Exception as exc:
     sys.exit(0)
 
 str_map = {}
-raw_base = int(base, 0) if is_elf == "0" else None
 with open(binary, "rb") as fh:
     blob = fh.read()
 for s in strings:
     va, paddr, size = s.get("vaddr"), s.get("paddr"), s.get("size")
-    if va is None or not size:
+    if not va or paddr is None or not size:
         continue
-    file_offset = va - raw_base if raw_base is not None else paddr
-    if file_offset is None or file_offset < 0 or file_offset + size > len(blob):
+    if paddr < 0 or paddr + size > len(blob):
         continue
-    raw = blob[file_offset:file_offset + size]
+    raw = blob[paddr:paddr + size]
     # Rebuild the true bytes from the binary itself, then emit a correct C
     # literal. Skip anything that is not clean printable ASCII + \n \t \r.
     chars = []
