@@ -475,7 +475,10 @@ with Path(script).open("w") as fh:
 PY
 fi
 
-analysis_r2_opts=(-q -e bin.cache=true)
+# radare2 6.1.x may truncate the function inventory for mapped raw ARM
+# images when bin.cache=true is enabled. Keep caching disabled for raw
+# firmware so aflj reflects the complete analysis result.
+analysis_r2_opts=(-q -e bin.cache=false)
 if [[ "$is_elf" -eq 0 ]]; then
   # Do not add -n here. Recent radare2 releases can crash when -n is combined
   # with a mapped raw ARM image; the normal raw loader is both sufficient and
@@ -637,7 +640,7 @@ data = json.loads(funcs_path.read_text() or "[]")
 with batch_path.open("w") as fh:
     fh.write("e scr.color=0\n")
     fh.write("e scr.interactive=false\n")
-    fh.write("e bin.cache=true\n")
+    fh.write("e bin.cache=false\n")
     if asm_arch:
         fh.write(f"e asm.arch={asm_arch}\n")
     if asm_bits:
@@ -670,7 +673,7 @@ with batch_path.open("w") as fh:
     fh.write("q\n")
 PY
 
-final_r2_opts=(-q -e bin.cache=true -e scr.color=0)
+final_r2_opts=(-q -e bin.cache=false -e scr.color=0)
 if [[ "$is_elf" -eq 0 ]]; then
   final_r2_opts+=(-a "$r2_asm_arch" -b "$r2_asm_bits" -m "$r2_base")
   if [[ -n "$raw_seed_r2" ]]; then
